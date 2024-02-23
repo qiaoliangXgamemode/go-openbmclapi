@@ -37,8 +37,8 @@ type RateController struct {
 	minWriteRate int
 
 	closed       atomic.Bool
-	closeCh      chan struct{}
-	rmux, wmux   sync.Mutex
+	closeChannl  chan struct{}
+	rmux, wmux   sync.RWMutex
 	lastRead     time.Time
 	preReadCount int
 	readCount    int
@@ -49,7 +49,7 @@ type RateController struct {
 func NewRateController(maxConn int, readRate, writeRate int) *RateController {
 	return &RateController{
 		Semaphore:    NewSemaphore(maxConn),
-		closeCh:      make(chan struct{}, 0),
+		closeChannl:  make(chan struct{}, 0),
 		readRate:     readRate,
 		minReadRate:  256,
 		writeRate:    writeRate,
@@ -209,7 +209,7 @@ func (l *RateController) preWrite(n int) (int, time.Duration) {
 // it will not close or interrupt the proxied connections and its operations
 func (l *RateController) Close() error {
 	if l.closed.CompareAndSwap(false, true) {
-		close(l.closeCh)
+		close(l.closeChannl)
 	}
 	return nil
 }
@@ -220,7 +220,7 @@ func (l *RateController) DoWithContext(ctx context.Context, operator func() (net
 	go func() {
 		select {
 		case <-ctx.Done():
-		case <-l.closeCh:
+		case <-l.closeChannl:
 			cancel()
 		}
 	}()
@@ -237,7 +237,7 @@ func (l *RateController) DoWithContext(ctx context.Context, operator func() (net
 }
 
 func (l *RateController) Do(operator func() (net.Conn, error)) (net.Conn, error) {
-	if !l.AcquireWithNotify(l.closeCh) {
+	if !l.AcquireWithNotify(l.closeChannl) {
 		return nil, net.ErrClosed
 	}
 	c, err := operator()
@@ -250,7 +250,7 @@ func (l *RateController) Do(operator func() (net.Conn, error)) (net.Conn, error)
 }
 
 func (l *RateController) DoReader(operator func() (io.Reader, error)) (io.ReadCloser, error) {
-	if !l.AcquireWithNotify(l.closeCh) {
+	if !l.AcquireWithNotify(l.closeChannl) {
 		return nil, net.ErrClosed
 	}
 	r, err := operator()
@@ -262,8 +262,8 @@ func (l *RateController) DoReader(operator func() (io.Reader, error)) (io.ReadCl
 	return conn, nil
 }
 
-func (l *RateController) DoWriter(operator func() (io.Writer, error)) (io.WriteCloser, error) {
-	if !l.AcquireWithNotify(l.closeCh) {
+func (l *RateController) DoWriter(operator func() (io.ReadWriteCloser, error)) (io.WriteCloser, error) {
+	if !l.AcquireWithNotify(l.closeChannl) {
 		return nil, net.ErrClosed
 	}
 	w, err := operator()
@@ -271,7 +271,7 @@ func (l *RateController) DoWriter(operator func() (io.Writer, error)) (io.WriteC
 		l.Release()
 		return nil, err
 	}
-	conn := &LimitedWriter{Writer: w, controller: l}
+	conn := &LimitedReadWriteCloser{ReadWriteCloser: w, controller: l}
 	return conn, nil
 }
 
@@ -281,26 +281,6 @@ type LimitedReader struct {
 
 	closed    atomic.Bool
 	readAfter time.Time
-}
-
-var _ io.ReadCloser = (*LimitedReader)(nil)
-
-func (r *LimitedReader) Read(buf []byte) (n int, err error) {
-	if !r.readAfter.IsZero() {
-		now := time.Now()
-		if dur := r.readAfter.Sub(now); dur > 0 {
-			time.Sleep(dur)
-		}
-	}
-	m := r.controller.preRead(len(buf))
-	n, err = r.Reader.Read(buf[:m])
-	dur := r.controller.afterRead(n, m-n)
-	if dur > 0 {
-		r.readAfter = time.Now().Add(dur)
-	} else {
-		r.readAfter = time.Time{}
-	}
-	return
 }
 
 func (r *LimitedReader) Close() error {
